@@ -1,277 +1,630 @@
-"""
-Real & nominal exchange-rate explorer using IMF SDMX 3.0 data.
 
-S(t)   = units of Country 2 currency per 1 unit of Country 1 currency
-RER(t) = S(t) * P1(t) / P2(t)
-RER*   = mean of RER(t) over valid months in the selected sample
-Real Index(t) = 100 * RER(t) / RER*
-"""
 from __future__ import annotations
 
-import os
-import re
-from typing import Optional
+import io
+from datetime import date
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
-BASE_URL = "https://api.imf.org/external/sdmx/3.0"
-START = pd.Timestamp("1976-01-01")
-HEADERS = {"Accept": "application/vnd.sdmx.data+json;version=2.0.0, application/json;q=0.9"}
-_sub_key = os.environ.get("IMF_SDMX_SUBSCRIPTION_KEY")
-if _sub_key:
-    HEADERS["Ocp-Apim-Subscription-Key"] = _sub_key
+try:
+    import pycountry
+except ImportError:
+    pycountry = None
 
-# Dataflow id -> versions to try (newest known first, then wildcard)
-FLOWS = {"CPI": ["5.0.0", "+"], "ER": ["4.0.1", "+"]}
 
-# IMF country / area codes (ISO3 + G163 for the Euro area). Availability is checked at fetch time.
-COUNTRIES = {
-    "AFG": "Afghanistan", "ALB": "Albania", "DZA": "Algeria", "AGO": "Angola", "ATG": "Antigua and Barbuda",
-    "ARG": "Argentina", "ARM": "Armenia", "ABW": "Aruba", "AUS": "Australia", "AUT": "Austria",
-    "AZE": "Azerbaijan", "BHS": "Bahamas", "BHR": "Bahrain", "BGD": "Bangladesh", "BRB": "Barbados",
-    "BLR": "Belarus", "BEL": "Belgium", "BLZ": "Belize", "BEN": "Benin", "BTN": "Bhutan",
-    "BOL": "Bolivia", "BIH": "Bosnia and Herzegovina", "BWA": "Botswana", "BRA": "Brazil",
-    "BRN": "Brunei Darussalam", "BGR": "Bulgaria", "BFA": "Burkina Faso", "BDI": "Burundi",
-    "CPV": "Cabo Verde", "KHM": "Cambodia", "CMR": "Cameroon", "CAN": "Canada",
-    "CAF": "Central African Republic", "TCD": "Chad", "CHL": "Chile", "CHN": "China", "COL": "Colombia",
-    "COM": "Comoros", "COD": "Congo, Dem. Rep.", "COG": "Congo, Rep.", "CRI": "Costa Rica",
-    "CIV": "Côte d'Ivoire", "HRV": "Croatia", "CYP": "Cyprus", "CZE": "Czech Republic", "DNK": "Denmark",
-    "DJI": "Djibouti", "DMA": "Dominica", "DOM": "Dominican Republic", "ECU": "Ecuador", "EGY": "Egypt",
-    "SLV": "El Salvador", "GNQ": "Equatorial Guinea", "ERI": "Eritrea", "EST": "Estonia",
-    "SWZ": "Eswatini", "ETH": "Ethiopia", "G163": "Euro area", "FJI": "Fiji", "FIN": "Finland",
-    "FRA": "France", "GAB": "Gabon", "GMB": "Gambia", "GEO": "Georgia", "DEU": "Germany", "GHA": "Ghana",
-    "GRC": "Greece", "GRD": "Grenada", "GTM": "Guatemala", "GIN": "Guinea", "GNB": "Guinea-Bissau",
-    "GUY": "Guyana", "HTI": "Haiti", "HND": "Honduras", "HKG": "Hong Kong SAR", "HUN": "Hungary",
-    "ISL": "Iceland", "IND": "India", "IDN": "Indonesia", "IRN": "Iran", "IRQ": "Iraq", "IRL": "Ireland",
-    "ISR": "Israel", "ITA": "Italy", "JAM": "Jamaica", "JPN": "Japan", "JOR": "Jordan",
-    "KAZ": "Kazakhstan", "KEN": "Kenya", "KIR": "Kiribati", "KOR": "Korea, Rep.", "KWT": "Kuwait",
-    "KGZ": "Kyrgyz Republic", "LAO": "Lao P.D.R.", "LVA": "Latvia", "LBN": "Lebanon", "LSO": "Lesotho",
-    "LBR": "Liberia", "LBY": "Libya", "LTU": "Lithuania", "LUX": "Luxembourg", "MAC": "Macao SAR",
-    "MDG": "Madagascar", "MWI": "Malawi", "MYS": "Malaysia", "MDV": "Maldives", "MLI": "Mali",
-    "MLT": "Malta", "MRT": "Mauritania", "MUS": "Mauritius", "MEX": "Mexico", "FSM": "Micronesia",
-    "MDA": "Moldova", "MNG": "Mongolia", "MNE": "Montenegro", "MAR": "Morocco", "MOZ": "Mozambique",
-    "MMR": "Myanmar", "NAM": "Namibia", "NPL": "Nepal", "NLD": "Netherlands", "NZL": "New Zealand",
-    "NIC": "Nicaragua", "NER": "Niger", "NGA": "Nigeria", "MKD": "North Macedonia", "NOR": "Norway",
-    "OMN": "Oman", "PAK": "Pakistan", "PAN": "Panama", "PNG": "Papua New Guinea", "PRY": "Paraguay",
-    "PER": "Peru", "PHL": "Philippines", "POL": "Poland", "PRT": "Portugal", "QAT": "Qatar",
-    "ROU": "Romania", "RUS": "Russian Federation", "RWA": "Rwanda", "WSM": "Samoa",
-    "STP": "São Tomé and Príncipe", "SAU": "Saudi Arabia", "SEN": "Senegal", "SRB": "Serbia",
-    "SYC": "Seychelles", "SLE": "Sierra Leone", "SGP": "Singapore", "SVK": "Slovak Republic",
-    "SVN": "Slovenia", "SLB": "Solomon Islands", "SOM": "Somalia", "ZAF": "South Africa",
-    "SSD": "South Sudan", "ESP": "Spain", "LKA": "Sri Lanka", "KNA": "St. Kitts and Nevis",
-    "LCA": "St. Lucia", "VCT": "St. Vincent and the Grenadines", "SDN": "Sudan", "SUR": "Suriname",
-    "SWE": "Sweden", "CHE": "Switzerland", "SYR": "Syria", "TWN": "Taiwan Province of China",
-    "TJK": "Tajikistan", "TZA": "Tanzania", "THA": "Thailand", "TLS": "Timor-Leste", "TGO": "Togo",
-    "TON": "Tonga", "TTO": "Trinidad and Tobago", "TUN": "Tunisia", "TUR": "Türkiye",
-    "TKM": "Turkmenistan", "UGA": "Uganda", "UKR": "Ukraine", "ARE": "United Arab Emirates",
-    "GBR": "United Kingdom", "USA": "United States", "URY": "Uruguay", "UZB": "Uzbekistan",
-    "VUT": "Vanuatu", "VEN": "Venezuela", "VNM": "Vietnam", "YEM": "Yemen", "ZMB": "Zambia",
-    "ZWE": "Zimbabwe",
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+st.set_page_config(
+    page_title="IMF Real Exchange Rate Explorer",
+    page_icon="📈",
+    layout="wide",
+)
+
+API_BASE = "https://api.imf.org/external/sdmx/3.0"
+START_MONTH = "1976-01"
+EURO_CODE = "G163"
+TIMEOUT = 40
+
+# The series keys follow the user's supplied IMF data hints.
+# CPI and exchange-rate data may be published in different flows.
+SERIES = {
+    "CPI": {
+        "key": "{code}.CPI._T.IX.M",
+        "flows": [
+            ("IMF.STA", "CPI"),
+        ],
+    },
+    "FX": {
+        "key": "{code}.XDC_USD.PA_RT.M",
+        "flows": [
+            ("IMF.STA", "IFS"),
+            ("IMF.STA", "ER"),
+            ("IMF.STA", "EXR"),
+        ],
+    },
 }
 
-_PERIOD_RE = re.compile(r"^(\d{4})-?(?:M)?(\d{2})$")
+
+# =========================================================
+# COUNTRY OPTIONS
+# =========================================================
+
+@st.cache_data
+def get_countries():
+    """Build an ISO alpha-3 selector and add the Euro area."""
+
+    countries = {"Euro area (G163)": EURO_CODE}
+
+    if pycountry is not None:
+        for item in pycountry.countries:
+            code = getattr(item, "alpha_3", None)
+            name = getattr(item, "name", None)
+            if code and name:
+                countries[f"{name} ({code})"] = code
+
+    # Add common economy codes that can be absent from ISO lists.
+    countries["Kosovo (UVK)"] = "UVK"
+    countries["Taiwan (TWN)"] = "TWN"
+
+    return dict(sorted(
+        countries.items(),
+        key=lambda item: (
+            item[1] != EURO_CODE,
+            item[0].casefold(),
+        ),
+    ))
 
 
-# --------------------------------------------------------------------------- data access
-def _parse_period(p: str) -> Optional[pd.Timestamp]:
-    m = _PERIOD_RE.match(str(p).strip())
-    if not m:
-        return None
-    return pd.Timestamp(int(m.group(1)), int(m.group(2)), 1)
+# =========================================================
+# IMF API
+# =========================================================
+
+def parse_period(value):
+    """Convert SDMX monthly periods to pandas timestamps."""
+
+    value = str(value).strip()
+
+    # SDMX monthly dates often look like 2024-M01.
+    value = value.replace("-M", "-")
+
+    try:
+        return pd.Period(value, freq="M").to_timestamp()
+    except (ValueError, TypeError):
+        return pd.NaT
 
 
-def _parse_sdmx_json(payload: dict) -> pd.Series:
-    """Parse an SDMX-JSON (1.0 or 2.0) message into a monthly Series (first series found)."""
-    data = payload.get("data", payload)
-    datasets = data.get("dataSets") or []
-    if not datasets:
-        return pd.Series(dtype=float)
-    structure = data.get("structure")
-    if structure is None:
-        structures = data.get("structures") or []
-        structure = structures[0] if structures else {}
-    obs_dims = (structure.get("dimensions") or {}).get("observation") or []
-    time_dim = next((d for d in obs_dims if d.get("id") == "TIME_PERIOD"), obs_dims[0] if obs_dims else None)
-    if time_dim is None:
-        return pd.Series(dtype=float)
-    time_values = [v.get("id") or v.get("value") or v.get("name") for v in time_dim.get("values", [])]
+def fetch_series(
+    code: str,
+    kind: str,
+    end_month: str,
+) -> pd.Series:
+    """
+    Fetch one IMF series using the SDMX 3.0 CSV response.
 
-    series_map = datasets[0].get("series") or {}
-    if not series_map:
-        return pd.Series(dtype=float)
-    first = next(iter(series_map.values()))
-    rows = {}
-    for idx, obs in (first.get("observations") or {}).items():
+    A request uses the latest flow version (~). The flow candidates
+    are tried in order because the exchange-rate flow must be
+    confirmed against the current IMF catalogue.
+    """
+
+    spec = SERIES[kind]
+    key = spec["key"].format(code=code)
+    errors = []
+
+    for agency, flow in spec["flows"]:
+        url = (
+            f"{API_BASE}/data/dataflow/"
+            f"{agency}/{flow}/~/{key}"
+        )
+
+        params = {
+            "startPeriod": START_MONTH,
+            "endPeriod": end_month,
+        }
+
         try:
-            ts = _parse_period(time_values[int(idx)])
-            val = obs[0] if isinstance(obs, list) else obs
-            if ts is not None and val is not None:
-                rows[ts] = float(val)
-        except (ValueError, IndexError, TypeError):
-            continue
-    return pd.Series(rows, dtype=float).sort_index()
+            response = requests.get(
+                url,
+                params=params,
+                headers={"Accept": "text/csv"},
+                timeout=TIMEOUT,
+            )
 
-
-def _request(flow: str, key: str) -> pd.Series:
-    """Try several SDMX 3.0 URL styles / versions until one returns data."""
-    for version in FLOWS[flow]:
-        urls = [
-            f"{BASE_URL}/data/IMF.STA,{flow},{version}/{key}",
-            f"{BASE_URL}/data/dataflow/IMF.STA/{flow}/{version}/{key}",
-        ]
-        for url in urls:
-            try:
-                r = requests.get(url, headers=HEADERS, timeout=60)
-            except requests.RequestException:
+            if response.status_code == 204:
+                errors.append(f"{flow}: no data returned")
                 continue
-            if r.status_code != 200:
+
+            if response.status_code in (400, 404):
+                errors.append(
+                    f"{flow}: HTTP {response.status_code}"
+                )
                 continue
-            try:
-                s = _parse_sdmx_json(r.json())
-            except ValueError:
+
+            response.raise_for_status()
+
+            content = response.text.strip()
+            if not content:
+                errors.append(f"{flow}: empty response")
                 continue
-            if not s.empty:
-                return s
-    return pd.Series(dtype=float)
+
+            # IMF may return a structured error rather than CSV.
+            if content.startswith("<"):
+                errors.append(
+                    f"{flow}: XML response instead of CSV"
+                )
+                continue
+
+            frame = pd.read_csv(io.StringIO(content))
+
+            # Normalize column names.
+            frame.columns = [
+                str(col).strip().upper()
+                for col in frame.columns
+            ]
+
+            if not {"TIME_PERIOD", "OBS_VALUE"}.issubset(
+                frame.columns
+            ):
+                errors.append(
+                    f"{flow}: missing TIME_PERIOD/OBS_VALUE "
+                    f"columns; got {list(frame.columns)}"
+                )
+                continue
+
+            frame["Date"] = frame["TIME_PERIOD"].map(parse_period)
+            frame["Value"] = pd.to_numeric(
+                frame["OBS_VALUE"],
+                errors="coerce",
+            )
+
+            frame = frame.dropna(subset=["Date", "Value"])
+            frame = frame[
+                (frame["Date"] >= pd.Timestamp(START_MONTH))
+                & (
+                    frame["Date"]
+                    <= pd.Period(end_month, freq="M").to_timestamp()
+                )
+            ]
+
+            if frame.empty:
+                errors.append(
+                    f"{flow}: no monthly observations for {code}"
+                )
+                continue
+
+            result = (
+                frame.sort_values("Date")
+                .drop_duplicates("Date", keep="last")
+                .set_index("Date")["Value"]
+                .astype(float)
+            )
+
+            result.name = kind
+            return result
+
+        except (
+            requests.RequestException,
+            pd.errors.ParserError,
+            ValueError,
+        ) as exc:
+            errors.append(f"{flow}: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(
+        f"Could not retrieve {kind} for {code}. "
+        "The series may be unavailable or the IMF flow may differ. "
+        + " | ".join(errors)
+    )
 
 
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def fetch_cpi(iso: str) -> pd.Series:
-    s = _request("CPI", f"{iso}.CPI._T.IX.M")
-    return s[s.index >= START]
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_country(code: str, end_month: str) -> pd.DataFrame:
+    """Load monthly CPI and local-currency-per-USD exchange rates."""
+
+    cpi = fetch_series(code, "CPI", end_month)
+    fx = fetch_series(code, "FX", end_month)
+
+    cpi.name = "CPI"
+    fx.name = "Local_currency_per_USD"
+
+    return pd.concat([cpi, fx], axis=1).sort_index()
 
 
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def fetch_lcu_per_usd(iso: str) -> pd.Series:
-    """Local-currency units per USD, period average, monthly."""
-    s = _request("ER", f"{iso}.XDC_USD.PA_RT.M")
-    if s.empty:
-        # Some dataflow versions publish the inverse (USD per local unit)
-        inv = _request("ER", f"{iso}.USD_XDC.PA_RT.M")
-        if not inv.empty:
-            s = 1.0 / inv.replace(0, np.nan)
-    if s.empty and iso == "USA":
-        s = pd.Series(1.0, index=pd.date_range(START, pd.Timestamp.today().normalize().replace(day=1), freq="MS"))
-    return s[s.index >= START].dropna()
+# =========================================================
+# CALCULATIONS
+# =========================================================
+
+def calculate_sample(
+    country1: pd.DataFrame,
+    country2: pd.DataFrame,
+    name1: str,
+    name2: str,
+    start_date: date,
+    end_date: date,
+):
+    """Calculate nominal S, RER, sample mean, and real index."""
+
+    a = country1.rename(columns={
+        "CPI": "P1_CPI",
+        "Local_currency_per_USD": "X1_per_USD",
+    })
+
+    b = country2.rename(columns={
+        "CPI": "P2_CPI",
+        "Local_currency_per_USD": "X2_per_USD",
+    })
+
+    df = a.join(b, how="outer").sort_index()
+    df.index.name = "Date"
+
+    start = pd.Timestamp(start_date).to_period("M").to_timestamp()
+    end = pd.Timestamp(end_date).to_period("M").to_timestamp()
+
+    df = df.loc[(df.index >= start) & (df.index <= end)].copy()
+
+    # X1 and X2 are local-currency units per USD.
+    # Therefore X2 / X1 is units of currency 2 per currency 1.
+    valid_fx = (
+        df["X1_per_USD"].gt(0)
+        & df["X2_per_USD"].gt(0)
+    )
+
+    df["S_nominal"] = (
+        df["X2_per_USD"] / df["X1_per_USD"]
+    ).where(valid_fx)
+
+    valid_cpi = df["P1_CPI"].gt(0) & df["P2_CPI"].gt(0)
+
+    df["RER"] = (
+        df["S_nominal"] * df["P1_CPI"] / df["P2_CPI"]
+    ).where(valid_fx & valid_cpi)
+
+    df["RER"] = df["RER"].where(
+        df["RER"].map(
+            lambda x: pd.notna(x) and abs(x) != float("inf")
+        )
+    )
+
+    # Mean over valid RER months in the selected sample.
+    rer_star = (
+        float(df["RER"].dropna().mean())
+        if df["RER"].notna().any()
+        else float("nan")
+    )
+
+    if pd.notna(rer_star) and rer_star != 0:
+        df["Real_Index"] = 100.0 * df["RER"] / rer_star
+    else:
+        df["Real_Index"] = float("nan")
+
+    df["Country1"] = name1
+    df["Country2"] = name2
+    df["Sample_RER_Mean"] = rer_star
+
+    return df.reset_index(), rer_star
 
 
-# --------------------------------------------------------------------------- calculations
-def build_panel(iso1: str, iso2: str) -> pd.DataFrame:
-    p1, p2 = fetch_cpi(iso1), fetch_cpi(iso2)
-    e1, e2 = fetch_lcu_per_usd(iso1), fetch_lcu_per_usd(iso2)
-    df = pd.concat(
-        {"CPI_1": p1, "CPI_2": p2, "LCU_per_USD_1": e1, "LCU_per_USD_2": e2}, axis=1
-    ).sort_index()
-    df.index.name = "date"
-    # S = C2 units per C1 unit = (C2 per USD) / (C1 per USD)
-    df["S"] = df["LCU_per_USD_2"] / df["LCU_per_USD_1"]
-    df["RER"] = df["S"] * df["CPI_1"] / df["CPI_2"]
-    df["valid"] = df[["CPI_1", "CPI_2", "S"]].notna().all(axis=1) & np.isfinite(df["RER"])
-    return df
+# =========================================================
+# CHART
+# =========================================================
 
+def create_chart(df, mode, name1, name2):
+    """Create a Plotly chart, with separate axes for Both."""
 
-def apply_sample(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> tuple[pd.DataFrame, float]:
-    sample = df.loc[(df.index >= start) & (df.index <= end)].copy()
-    rer_star = sample.loc[sample["valid"], "RER"].mean()
-    sample["RER_star"] = rer_star
-    sample["Real_Index"] = np.where(sample["valid"], 100.0 * sample["RER"] / rer_star, np.nan)
-    return sample, rer_star
-
-
-# --------------------------------------------------------------------------- UI
-def make_chart(sample: pd.DataFrame, mode: str, n1: str, n2: str, c1: str, c2: str) -> go.Figure:
-    real = go.Scatter(x=sample.index, y=sample["Real_Index"], name="Real Index (RER/RER* × 100)",
-                      mode="lines", line=dict(color="#1f77b4", width=2), connectgaps=False)
-    nom = go.Scatter(x=sample.index, y=sample["S"], name=f"Nominal S ({n2} per {n1})",
-                     mode="lines", line=dict(color="#d62728", width=2, dash="dot" if mode == "Both" else "solid"),
-                     connectgaps=False)
     if mode == "Both":
         fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(real, secondary_y=False)
-        fig.add_trace(nom, secondary_y=True)
-        fig.update_yaxes(title_text="Real Index (sample average = 100)", secondary_y=False)
-        fig.update_yaxes(title_text=f"Nominal S: {n2} per 1 {n1}", secondary_y=True, showgrid=False)
     else:
-        fig = go.Figure(real if mode == "Real" else nom)
-        if mode == "Real":
-            fig.add_hline(y=100, line_dash="dash", line_color="gray")
-            fig.update_yaxes(title_text="Real Index (sample average = 100)")
+        fig = go.Figure()
+
+    if mode in ("Real", "Both"):
+        trace = go.Scatter(
+            x=df["Date"],
+            y=df["Real_Index"],
+            name="Real Index",
+            mode="lines",
+            connectgaps=False,
+            line={"color": "#1769AA", "width": 2},
+            hovertemplate=(
+                "%{x|%Y-%m}<br>Real Index: %{y:.4f}"
+                "<extra></extra>"
+            ),
+        )
+        if mode == "Both":
+            fig.add_trace(trace, secondary_y=False)
         else:
-            fig.update_yaxes(title_text=f"Nominal S: {n2} per 1 {n1}")
-    fig.update_layout(hovermode="x unified", height=520, margin=dict(l=10, r=10, t=40, b=10),
-                      legend=dict(orientation="h", y=1.08), title=f"{n1} → {n2}")
-    fig.update_xaxes(title_text="Month", rangeslider=dict(visible=True))
+            fig.add_trace(trace)
+
+    if mode in ("Nominal", "Both"):
+        trace = go.Scatter(
+            x=df["Date"],
+            y=df["S_nominal"],
+            name=f"Nominal ({name2} per {name1})",
+            mode="lines",
+            connectgaps=False,
+            line={"color": "#D97706", "width": 2},
+            hovertemplate=(
+                "%{x|%Y-%m}<br>Nominal S: %{y:.8g}"
+                "<extra></extra>"
+            ),
+        )
+        if mode == "Both":
+            fig.add_trace(trace, secondary_y=True)
+        else:
+            fig.add_trace(trace)
+
+    fig.update_layout(
+        template="plotly_white",
+        title=f"{name1} / {name2}",
+        hovermode="x unified",
+        height=560,
+        legend={"orientation": "h", "y": 1.12},
+        margin={"l": 30, "r": 30, "t": 85, "b": 35},
+    )
+
+    if mode == "Both":
+        fig.update_yaxes(
+            title_text="Real Index (sample mean = 100)",
+            secondary_y=False,
+        )
+        fig.update_yaxes(
+            title_text=f"Nominal S ({name2} per {name1})",
+            secondary_y=True,
+        )
+    elif mode == "Real":
+        fig.update_yaxes(title_text="Real Index (sample mean = 100)")
+    else:
+        fig.update_yaxes(
+            title_text=f"Nominal S ({name2} per {name1})"
+        )
+
+    fig.update_xaxes(
+        title_text="Month",
+        rangeslider_visible=True,
+    )
+
     return fig
 
 
-def main() -> None:
-    st.set_page_config(page_title="IMF Real Exchange Rate Explorer", layout="wide")
-    st.title("Real vs. nominal exchange rate (IMF data)")
-    st.caption("S(t) = units of Country 2 currency per 1 unit of Country 1 currency · "
-               "RER(t) = S(t) × P1(t) / P2(t) · Real Index = 100 × RER(t) / RER*")
+# =========================================================
+# USER INTERFACE
+# =========================================================
 
-    names = {iso: f"{n} ({iso})" for iso, n in COUNTRIES.items()}
-    ordered = sorted(COUNTRIES, key=lambda k: COUNTRIES[k])
-    with st.sidebar:
-        st.header("Selection")
-        iso1 = st.selectbox("Country 1 (base)", ordered, index=ordered.index("USA"), format_func=names.get)
-        iso2 = st.selectbox("Country 2 (quote)", ordered, index=ordered.index("G163"), format_func=names.get)
-        mode = st.radio("Chart", ["Real", "Nominal", "Both"], horizontal=True)
+st.title("IMF Real Exchange Rate Explorer")
 
-    if iso1 == iso2:
-        st.warning("Please choose two different countries/areas.")
-        return
+st.write(
+    "Compare monthly nominal and CPI-adjusted exchange rates. "
+    "Historical observations are requested from January 1976, "
+    "where available."
+)
 
-    with st.spinner("Fetching IMF data…"):
-        panel = build_panel(iso1, iso2)
+st.info(
+    "The real index is normalized to the mean RER over the selected "
+    "sample. Changing the date range recalculates the mean. "
+    "The nominal rate is never normalized."
+)
 
-    missing = [lbl for lbl, col in [(f"CPI – {COUNTRIES[iso1]}", "CPI_1"), (f"CPI – {COUNTRIES[iso2]}", "CPI_2"),
-                                    (f"Exchange rate – {COUNTRIES[iso1]}", "LCU_per_USD_1"),
-                                    (f"Exchange rate – {COUNTRIES[iso2]}", "LCU_per_USD_2")]
-               if panel[col].dropna().empty]
-    if missing:
-        st.error("No data returned from the IMF for: " + "; ".join(missing) +
-                 ". Try another country, or check your network / IMF API access.")
-        return
+countries = get_countries()
+labels = list(countries)
 
-    valid_idx = panel.index[panel["valid"]]
-    if valid_idx.empty:
-        st.error("The two series have no overlapping valid months.")
-        return
+default1 = next(
+    (i for i, label in enumerate(labels) if countries[label] == "USA"),
+    0,
+)
+default2 = next(
+    (i for i, label in enumerate(labels) if countries[label] == "JPN"),
+    min(1, len(labels) - 1),
+)
 
-    months = list(pd.date_range(valid_idx.min(), valid_idx.max(), freq="MS"))
-    with st.sidebar:
-        start, end = st.select_slider("Sample period", options=months, value=(months[0], months[-1]),
-                                      format_func=lambda d: d.strftime("%Y-%m"))
-    sample, rer_star = apply_sample(panel, start, end)
-    n1, n2 = COUNTRIES[iso1], COUNTRIES[iso2]
+col1, col2 = st.columns(2)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("RER* (sample average of RER)", f"{rer_star:,.4f}")
-    c2.metric("Valid months in sample", f"{int(sample['valid'].sum())}")
-    c3.metric("Latest Real Index", f"{sample['Real_Index'].dropna().iloc[-1]:,.1f}")
+with col1:
+    label1 = st.selectbox("Country 1", labels, index=default1)
 
-    st.plotly_chart(make_chart(sample, mode, n1, n2, iso1, iso2), use_container_width=True)
+with col2:
+    label2 = st.selectbox("Country 2", labels, index=default2)
 
-    out = sample.reset_index().rename(columns={
-        "CPI_1": f"P1_CPI_{iso1}", "CPI_2": f"P2_CPI_{iso2}",
-        "LCU_per_USD_1": f"{iso1}_LCU_per_USD", "LCU_per_USD_2": f"{iso2}_LCU_per_USD",
-        "S": f"S_{iso2}_per_{iso1}", "RER": "RER", "RER_star": "RER_star",
-        "Real_Index": "Real_Index", "valid": "valid_month",
-    })
-    out["date"] = out["date"].dt.strftime("%Y-%m")
-    st.download_button("Download CSV (selected sample)", out.to_csv(index=False).encode("utf-8"),
-                       file_name=f"rer_{iso1}_{iso2}_{start:%Y%m}_{end:%Y%m}.csv", mime="text/csv")
-    with st.expander("Show data"):
-        st.dataframe(out, use_container_width=True, hide_index=True)
-    st.caption("Source: IMF SDMX 3.0 API (CPI and Exchange Rates dataflows). Months missing any input "
-               "are excluded from RER* and left blank in the Real Index.")
+code1 = countries[label1]
+code2 = countries[label2]
 
+if code1 == code2:
+    st.error("Please choose two different economies.")
+    st.stop()
 
-if __name__ == "__main__":
-    main()
+today = date.today()
+this_month = pd.Timestamp(today).to_period("M").to_timestamp().date()
+earliest = date(1976, 1, 1)
+
+d1, d2 = st.columns(2)
+
+with d1:
+    start_date = st.date_input(
+        "Start month",
+        value=earliest,
+        min_value=earliest,
+        max_value=this_month,
+        key="sample_start",
+    )
+
+with d2:
+    end_date = st.date_input(
+        "End month",
+        value=this_month,
+        min_value=earliest,
+        max_value=this_month,
+        key="sample_end",
+    )
+
+mode = st.radio(
+    "Chart",
+    ["Real", "Nominal", "Both"],
+    horizontal=True,
+)
+
+if start_date > end_date:
+    st.error("Start month must not be after end month.")
+    st.stop()
+
+end_month = pd.Timestamp(end_date).strftime("%Y-%m")
+
+try:
+    with st.spinner("Downloading IMF monthly data..."):
+        data1 = load_country(code1, end_month)
+        data2 = load_country(code2, end_month)
+
+    sample, rer_star = calculate_sample(
+        data1,
+        data2,
+        label1,
+        label2,
+        start_date,
+        end_date,
+    )
+
+except Exception as exc:
+    st.error("Unable to load the selected IMF series.")
+    st.markdown(
+        "The IMF flow or series may be unavailable, or the API may "
+        "have changed its response. Expand the details below to "
+        "identify the failing request."
+    )
+    with st.expander("Technical error details", expanded=True):
+        st.code(f"{type(exc).__name__}: {exc}")
+    st.link_button(
+        "Open IMF API documentation",
+        "https://data.imf.org/en/Resource-Pages/IMF-API",
+    )
+    st.stop()
+
+if sample.empty:
+    st.warning("No observations are available in this sample period.")
+    st.stop()
+
+valid_rer = int(sample["RER"].notna().sum())
+valid_nominal = int(sample["S_nominal"].notna().sum())
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Months in sample", f"{len(sample):,}")
+m2.metric("Valid RER months", f"{valid_rer:,}")
+m3.metric(
+    "Sample mean RER*",
+    f"{rer_star:.6g}" if pd.notna(rer_star) else "Unavailable",
+)
+
+if valid_rer == 0:
+    st.warning(
+        "No months have valid CPI and exchange-rate observations "
+        "for both economies. The nominal rate may still be available."
+    )
+
+st.plotly_chart(
+    create_chart(sample, mode, code1, code2),
+    use_container_width=True,
+)
+
+# =========================================================
+# OBSERVATIONS TABLE
+# =========================================================
+
+st.subheader("Observations and calculations")
+
+columns = [
+    "Date",
+    "Country1",
+    "Country2",
+    "P1_CPI",
+    "P2_CPI",
+    "X1_per_USD",
+    "X2_per_USD",
+    "S_nominal",
+    "RER",
+    "Sample_RER_Mean",
+    "Real_Index",
+]
+
+table = sample[columns].copy()
+table["Date"] = pd.to_datetime(table["Date"]).dt.strftime("%Y-%m")
+
+st.dataframe(
+    table,
+    use_container_width=True,
+    hide_index=True,
+)
+
+# =========================================================
+# CSV DOWNLOAD
+# =========================================================
+
+csv_data = sample[columns].to_csv(
+    index=False,
+    na_rep="",
+    date_format="%Y-%m-%d",
+).encode("utf-8")
+
+filename = (
+    f"rer_{code1}_{code2}_"
+    f"{pd.Timestamp(start_date).strftime('%Y%m')}_"
+    f"{pd.Timestamp(end_date).strftime('%Y%m')}.csv"
+)
+
+st.download_button(
+    "Download all sample observations as CSV",
+    data=csv_data,
+    file_name=filename,
+    mime="text/csv",
+)
+
+# =========================================================
+# METHODOLOGY
+# =========================================================
+
+with st.expander("Methodology"):
+    st.markdown(
+        r"""
+        **Nominal exchange rate**
+
+        The IMF exchange-rate series is local currency units per USD.
+        Let \(X_1(t)\) and \(X_2(t)\) be those series.
+
+        \[
+        S(t) = \frac{X_2(t)}{X_1(t)}
+        \]
+
+        This gives units of Country 2 currency per unit of Country 1
+        currency.
+
+        **Real exchange rate**
+
+        \[
+        RER(t) = S(t) \times \frac{P_1(t)}{P_2(t)}
+        \]
+
+        **Selected-sample mean**
+
+        \[
+        RER^* = \frac{1}{N}\sum_{t \in V} RER(t)
+        \]
+
+        Here, \(V\) is the set of valid months in the selected period.
+
+        **Real index**
+
+        \[
+        RealIndex(t) = 100 \times \frac{RER(t)}{RER^*}
+        \]
+
+        The real index averages 100 over valid observations in the
+        selected sample. This benchmark is not necessarily an
+        equilibrium exchange rate.
+
+        Missing observations are not interpolated.
+        """
+    )
+
+st.caption(
+    "Source: IMF. January 1976 is the earliest requested month; "
+    "actual data availability varies by economy and series."
+)
