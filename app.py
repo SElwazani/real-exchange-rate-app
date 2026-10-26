@@ -85,7 +85,7 @@ def _parse_period(p: str) -> Optional[pd.Timestamp]:
 
 
 def _parse_sdmx_json(payload: dict) -> pd.Series:
-    """Parse an SDMX-JSON (1.0 or 2.0) message into a monthly Series (first series found)."""
+    Parse an SDMX-JSON (1.0 or 2.0) message into a monthly Series (first series found).
     data = payload.get("data", payload)
     datasets = data.get("dataSets") or []
     if not datasets:
@@ -117,7 +117,7 @@ def _parse_sdmx_json(payload: dict) -> pd.Series:
 
 
 def _request(flow: str, key: str) -> pd.Series:
-    """Try several SDMX 3.0 URL styles / versions until one returns data."""
+    Try several SDMX 3.0 URL styles / versions until one returns data.
     for version in FLOWS[flow]:
         urls = [
             f"{BASE_URL}/data/IMF.STA,{flow},{version}/{key}",
