@@ -1,10 +1,3 @@
-Real & nominal exchange-rate explorer using IMF SDMX 3.0 data.
-
-S(t)   = units of Country 2 currency per 1 unit of Country 1 currency
-RER(t) = S(t) * P1(t) / P2(t)
-RER*   = mean of RER(t) over valid months in the selected sample
-Real Index(t) = 100 * RER(t) / RER*
-
 from __future__ import annotations
 
 import os
