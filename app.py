@@ -147,7 +147,7 @@ def fetch_cpi(iso: str) -> pd.Series:
 
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
 def fetch_lcu_per_usd(iso: str) -> pd.Series:
-    """Local-currency units per USD, period average, monthly."""
+    Local-currency units per USD, period average, monthly.
     s = _request("ER", f"{iso}.XDC_USD.PA_RT.M")
     if s.empty:
         # Some dataflow versions publish the inverse (USD per local unit)
